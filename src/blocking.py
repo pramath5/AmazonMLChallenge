@@ -1,6 +1,7 @@
+import os
 import pandas as pd
-import numpy as np
 from collections import defaultdict, Counter
+
 
 from preprocessing import (
     normalize_name,
@@ -10,169 +11,629 @@ from preprocessing import (
 )
 
 
-S1_FILE =  TRAIN_DIR / "train_source1.tsv"
-S2_FILE = TRAIN_DIR / "train_source2.tsv"
-S3_FILE = TRAIN_DIR / "train_source3.tsv"
+# ============================================================
+# FILES
+# ============================================================
+
+S1_FILE = "../dataset/train/train_source1.tsv"
+S2_FILE = "../dataset/train/train_source2.tsv"
+S3_FILE = "../dataset/train/train_source3.tsv"
+
+OUTPUT_DIR = "../output"
+CANDIDATE_FILE = os.path.join(
+    OUTPUT_DIR,
+    "candidate_pairs.tsv"
+)
 
 
-# Maximum number of target records allowed in a block.
-# Tokens occurring more often than this are ignored.
-MAX_BLOCK_SIZE = 5000
+# ============================================================
+# V3 SETTINGS
+# KEEPING THE SETTINGS THAT GAVE 632.8 AVG CANDIDATES
+# ============================================================
+
+MAX_SINGLE_TOKEN = 500
+MAX_COMPOUND_BLOCK = 5000
 
 
-def build_index(df, field, max_block_size=MAX_BLOCK_SIZE):
+# ============================================================
+# HELPER
+# ============================================================
 
-    index = defaultdict(list)
+def sorted_pair(a, b):
 
-    frequencies = Counter()
+    if a <= b:
+        return a, b
 
-    print(f"Building frequency index for {field}...")
+    return b, a
 
-    # First calculate token frequencies
-    for value in df[field]:
 
-        if not isinstance(value, str):
-            continue
+# ============================================================
+# BUILD INDEXES
+# ============================================================
 
-        tokens = get_tokens(value)
+def build_indexes(s2, s3):
 
-        # Count each token only once per record
-        for token in set(tokens):
-            frequencies[token] += 1
+    print("\n" + "=" * 70)
+    print("BUILDING V3 BLOCKING INDEXES")
+    print("=" * 70)
 
-    print(f"Unique tokens: {len(frequencies):,}")
+    name_frequency = Counter()
+    address_frequency = Counter()
+    number_frequency = Counter()
 
-    # Keep only selective tokens
-    useful_tokens = {
-        token
-        for token, count in frequencies.items()
-        if count <= max_block_size
-    }
+    # --------------------------------------------------------
+    # NAME FREQUENCY
+    # --------------------------------------------------------
+
+    print("\nCounting name token frequencies...")
+
+    for source, df in [("S2", s2), ("S3", s3)]:
+
+        print(f"Processing {source} names...")
+
+        for value in df["business_name"]:
+
+            if not isinstance(value, str):
+                continue
+
+            tokens = set(
+                get_tokens(
+                    normalize_name(value)
+                )
+            )
+
+            for token in tokens:
+
+                if len(token) >= 2:
+                    name_frequency[token] += 1
 
     print(
-        f"Useful tokens: {len(useful_tokens):,}"
+        "Unique name tokens:",
+        f"{len(name_frequency):,}"
     )
 
-    # Build inverted index
-    for idx, value in enumerate(df[field]):
+    # --------------------------------------------------------
+    # ADDRESS FREQUENCY
+    # --------------------------------------------------------
 
-        if not isinstance(value, str):
-            continue
+    print("\nCounting address token frequencies...")
 
-        tokens = set(get_tokens(value))
+    for source, df in [("S2", s2), ("S3", s3)]:
 
-        for token in tokens:
+        print(f"Processing {source} addresses...")
 
-            if token in useful_tokens:
-                index[token].append(idx)
+        for value in df["business_address"]:
 
-    return index, frequencies
+            if not isinstance(value, str):
+                continue
+
+            tokens = set(
+                get_tokens(
+                    normalize_address(value)
+                )
+            )
+
+            for token in tokens:
+
+                if len(token) >= 2:
+                    address_frequency[token] += 1
+
+    print(
+        "Unique address tokens:",
+        f"{len(address_frequency):,}"
+    )
+
+    # --------------------------------------------------------
+    # NUMBER FREQUENCY
+    # --------------------------------------------------------
+
+    print("\nCounting address number frequencies...")
+
+    for source, df in [("S2", s2), ("S3", s3)]:
+
+        print(f"Processing {source} numbers...")
+
+        for value in df["business_address"]:
+
+            if not isinstance(value, str):
+                continue
+
+            numbers = set(
+                extract_numbers(value)
+            )
+
+            for number in numbers:
+                number_frequency[number] += 1
+
+    print(
+        "Unique numbers:",
+        f"{len(number_frequency):,}"
+    )
+
+    # --------------------------------------------------------
+    # INDEXES
+    # --------------------------------------------------------
+
+    name_pair_index = defaultdict(list)
+    address_pair_index = defaultdict(list)
+    number_address_index = defaultdict(list)
+
+    name_single_index = defaultdict(list)
+    address_single_index = defaultdict(list)
+
+    # --------------------------------------------------------
+    # BUILD TARGET INDEXES
+    # --------------------------------------------------------
+
+    for source, df in [
+        ("S2", s2),
+        ("S3", s3)
+    ]:
+
+        print(
+            f"\nBuilding indexes for {source}..."
+        )
+
+        for idx in range(len(df)):
+
+            name_value = df.iloc[idx]["business_name"]
+            address_value = df.iloc[idx]["business_address"]
+
+            # ------------------------------------------------
+            # NAME TOKENS
+            # ------------------------------------------------
+
+            if isinstance(name_value, str):
+
+                name_tokens = list(
+                    set(
+                        get_tokens(
+                            normalize_name(name_value)
+                        )
+                    )
+                )
+
+                name_tokens = [
+                    token
+                    for token in name_tokens
+                    if len(token) >= 2
+                ]
+
+            else:
+
+                name_tokens = []
+
+            # ------------------------------------------------
+            # ADDRESS TOKENS
+            # ------------------------------------------------
+
+            if isinstance(address_value, str):
+
+                address_tokens = list(
+                    set(
+                        get_tokens(
+                            normalize_address(address_value)
+                        )
+                    )
+                )
+
+                address_tokens = [
+                    token
+                    for token in address_tokens
+                    if len(token) >= 2
+                ]
+
+            else:
+
+                address_tokens = []
+
+            # ------------------------------------------------
+            # NUMBERS
+            # ------------------------------------------------
+
+            if isinstance(address_value, str):
+
+                numbers = list(
+                    set(
+                        extract_numbers(address_value)
+                    )
+                )
+
+            else:
+
+                numbers = []
+
+            # =================================================
+            # NAME PAIRS
+            # =================================================
+
+            for i in range(len(name_tokens)):
+
+                for j in range(i + 1, len(name_tokens)):
+
+                    a = name_tokens[i]
+                    b = name_tokens[j]
+
+                    if (
+                        name_frequency[a]
+                        <= MAX_COMPOUND_BLOCK
+                        and
+                        name_frequency[b]
+                        <= MAX_COMPOUND_BLOCK
+                    ):
+
+                        key = sorted_pair(a, b)
+
+                        name_pair_index[key].append(
+                            (source, idx)
+                        )
+
+            # =================================================
+            # ADDRESS PAIRS
+            # =================================================
+
+            for i in range(len(address_tokens)):
+
+                for j in range(i + 1, len(address_tokens)):
+
+                    a = address_tokens[i]
+                    b = address_tokens[j]
+
+                    if (
+                        address_frequency[a]
+                        <= MAX_COMPOUND_BLOCK
+                        and
+                        address_frequency[b]
+                        <= MAX_COMPOUND_BLOCK
+                    ):
+
+                        key = sorted_pair(a, b)
+
+                        address_pair_index[key].append(
+                            (source, idx)
+                        )
+
+            # =================================================
+            # NUMBER + ADDRESS
+            # =================================================
+
+            for number in numbers:
+
+                if (
+                    number_frequency[number]
+                    > MAX_COMPOUND_BLOCK
+                ):
+                    continue
+
+                for token in address_tokens:
+
+                    if (
+                        address_frequency[token]
+                        > MAX_COMPOUND_BLOCK
+                    ):
+                        continue
+
+                    key = (number, token)
+
+                    number_address_index[key].append(
+                        (source, idx)
+                    )
+
+            # =================================================
+            # RARE NAME TOKEN
+            # =================================================
+
+            for token in name_tokens:
+
+                if (
+                    name_frequency[token]
+                    <= MAX_SINGLE_TOKEN
+                ):
+
+                    name_single_index[token].append(
+                        (source, idx)
+                    )
+
+            # =================================================
+            # RARE ADDRESS TOKEN
+            # =================================================
+
+            for token in address_tokens:
+
+                if (
+                    address_frequency[token]
+                    <= MAX_SINGLE_TOKEN
+                ):
+
+                    address_single_index[token].append(
+                        (source, idx)
+                    )
+
+        print(
+            f"Finished {source}"
+        )
+
+    return (
+        name_pair_index,
+        address_pair_index,
+        number_address_index,
+        name_single_index,
+        address_single_index,
+        name_frequency,
+        address_frequency,
+        number_frequency
+    )
 
 
-def build_number_index(df):
+# ============================================================
+# PRECOMPUTE COUNTRY ARRAYS
+# ============================================================
 
-    index = defaultdict(list)
+def build_country_sets(s2, s3):
 
-    print("Building number index...")
+    print("\nBuilding country filters...")
 
-    for idx, value in enumerate(df["business_address"]):
+    s2_countries = {}
 
-        if not isinstance(value, str):
-            continue
+    for idx, country in enumerate(s2["country"]):
 
-        numbers = set(extract_numbers(value))
+        s2_countries[idx] = country
 
-        for number in numbers:
+    s3_countries = {}
 
-            # Ignore extremely common numbers
-            index[number].append(idx)
+    for idx, country in enumerate(s3["country"]):
 
-    return index
+        s3_countries[idx] = country
 
+    return s2_countries, s3_countries
+
+
+# ============================================================
+# GET CANDIDATES
+# ============================================================
 
 def get_candidates(
     s1_row,
-    s2,
-    s3,
-    name_index,
-    address_index,
-    number_index
+    name_pair_index,
+    address_pair_index,
+    number_address_index,
+    name_single_index,
+    address_single_index,
+    name_frequency,
+    address_frequency,
+    number_frequency,
+    s2_countries,
+    s3_countries
 ):
 
     candidates = set()
 
+    # --------------------------------------------------------
+    # NORMALIZE
+    # --------------------------------------------------------
+
+    name_value = s1_row["business_name"]
+    address_value = s1_row["business_address"]
     country = s1_row["country"]
 
-    name = normalize_name(s1_row["business_name"])
-    address = normalize_address(s1_row["business_address"])
+    if isinstance(name_value, str):
 
-    # -----------------------------
-    # NAME BLOCKING
-    # -----------------------------
+        name_tokens = list(
+            set(
+                get_tokens(
+                    normalize_name(name_value)
+                )
+            )
+        )
 
-    for token in set(get_tokens(name)):
+        name_tokens = [
+            token
+            for token in name_tokens
+            if len(token) >= 2
+        ]
 
-        if token in name_index:
+    else:
 
-            for source, idx in name_index[token]:
+        name_tokens = []
 
-                if source == "S2":
-                    candidates.add(("S2", idx))
-                else:
-                    candidates.add(("S3", idx))
+    if isinstance(address_value, str):
 
-    # -----------------------------
-    # ADDRESS BLOCKING
-    # -----------------------------
+        address_tokens = list(
+            set(
+                get_tokens(
+                    normalize_address(address_value)
+                )
+            )
+        )
 
-    for token in set(get_tokens(address)):
+        address_tokens = [
+            token
+            for token in address_tokens
+            if len(token) >= 2
+        ]
 
-        if token in address_index:
+        numbers = list(
+            set(
+                extract_numbers(address_value)
+            )
+        )
 
-            for source, idx in address_index[token]:
+    else:
 
-                if source == "S2":
-                    candidates.add(("S2", idx))
-                else:
-                    candidates.add(("S3", idx))
+        address_tokens = []
+        numbers = []
 
-    # -----------------------------
-    # NUMBER BLOCKING
-    # -----------------------------
+    # ========================================================
+    # ROUTE 1 — TWO NAME TOKENS
+    # ========================================================
 
-    for number in set(extract_numbers(address)):
+    for i in range(len(name_tokens)):
 
-        if number in number_index:
+        for j in range(i + 1, len(name_tokens)):
 
-            for source, idx in number_index[number]:
+            a = name_tokens[i]
+            b = name_tokens[j]
 
-                if source == "S2":
-                    candidates.add(("S2", idx))
-                else:
-                    candidates.add(("S3", idx))
+            if (
+                name_frequency.get(a, 999999999)
+                <= MAX_COMPOUND_BLOCK
+                and
+                name_frequency.get(b, 999999999)
+                <= MAX_COMPOUND_BLOCK
+            ):
 
-    # -----------------------------
+                key = sorted_pair(a, b)
+
+                for candidate in name_pair_index.get(
+                    key,
+                    []
+                ):
+
+                    candidates.add(candidate)
+
+    # ========================================================
+    # ROUTE 2 — TWO ADDRESS TOKENS
+    # ========================================================
+
+    for i in range(len(address_tokens)):
+
+        for j in range(i + 1, len(address_tokens)):
+
+            a = address_tokens[i]
+            b = address_tokens[j]
+
+            if (
+                address_frequency.get(a, 999999999)
+                <= MAX_COMPOUND_BLOCK
+                and
+                address_frequency.get(b, 999999999)
+                <= MAX_COMPOUND_BLOCK
+            ):
+
+                key = sorted_pair(a, b)
+
+                for candidate in address_pair_index.get(
+                    key,
+                    []
+                ):
+
+                    candidates.add(candidate)
+
+    # ========================================================
+    # ROUTE 3 — NUMBER + ADDRESS TOKEN
+    # ========================================================
+
+    for number in numbers:
+
+        if (
+            number_frequency.get(
+                number,
+                999999999
+            )
+            > MAX_COMPOUND_BLOCK
+        ):
+            continue
+
+        for token in address_tokens:
+
+            if (
+                address_frequency.get(
+                    token,
+                    999999999
+                )
+                > MAX_COMPOUND_BLOCK
+            ):
+                continue
+
+            key = (number, token)
+
+            for candidate in number_address_index.get(
+                key,
+                []
+            ):
+
+                candidates.add(candidate)
+
+    # ========================================================
+    # ROUTE 4 — RARE NAME TOKEN
+    # ========================================================
+
+    for token in name_tokens:
+
+        if (
+            name_frequency.get(
+                token,
+                999999999
+            )
+            <= MAX_SINGLE_TOKEN
+        ):
+
+            for candidate in name_single_index.get(
+                token,
+                []
+            ):
+
+                candidates.add(candidate)
+
+    # ========================================================
+    # ROUTE 5 — RARE ADDRESS TOKEN
+    # ========================================================
+
+    for token in address_tokens:
+
+        if (
+            address_frequency.get(
+                token,
+                999999999
+            )
+            <= MAX_SINGLE_TOKEN
+        ):
+
+            for candidate in address_single_index.get(
+                token,
+                []
+            ):
+
+                candidates.add(candidate)
+
+    # ========================================================
     # COUNTRY FILTER
-    # -----------------------------
+    # ========================================================
 
-    filtered = set()
+    filtered = []
 
     for source, idx in candidates:
 
         if source == "S2":
-            if s2.iloc[idx]["country"] == country:
-                filtered.add((source, idx))
+
+            if s2_countries[idx] == country:
+
+                filtered.append(
+                    (source, idx)
+                )
 
         else:
-            if s3.iloc[idx]["country"] == country:
-                filtered.add((source, idx))
+
+            if s3_countries[idx] == country:
+
+                filtered.append(
+                    (source, idx)
+                )
 
     return filtered
 
 
+# ============================================================
+# MAIN
+# ============================================================
+
 def main():
 
-    print("Loading data...")
+    print("=" * 70)
+    print("FULL V3 BLOCKING")
+    print("=" * 70)
+
+    print("\nLoading data...")
 
     s1 = pd.read_csv(
         S1_FILE,
@@ -193,245 +654,191 @@ def main():
     )
 
     print()
-    print("S1:", len(s1))
-    print("S2:", len(s2))
-    print("S3:", len(s3))
+    print("S1:", f"{len(s1):,}")
+    print("S2:", f"{len(s2):,}")
+    print("S3:", f"{len(s3):,}")
 
-    # ----------------------------------------
-    # ADD SOURCE LABEL
-    # ----------------------------------------
+    # --------------------------------------------------------
+    # BUILD INDEXES
+    # --------------------------------------------------------
 
-    s2_indexed = []
-    s3_indexed = []
-
-    # Name index
-    print("\nBuilding name index...")
-
-    name_index = defaultdict(list)
-
-    name_frequency = Counter()
-
-    for source, df in [("S2", s2), ("S3", s3)]:
-
-        for idx, value in enumerate(df["business_name"]):
-
-            if not isinstance(value, str):
-                continue
-
-            tokens = set(get_tokens(normalize_name(value)))
-
-            for token in tokens:
-                name_frequency[token] += 1
-
-    useful_name_tokens = {
-        token
-        for token, count in name_frequency.items()
-        if count <= MAX_BLOCK_SIZE
-    }
-
-    print(
-        "Total name tokens:",
-        len(name_frequency)
+    (
+        name_pair_index,
+        address_pair_index,
+        number_address_index,
+        name_single_index,
+        address_single_index,
+        name_frequency,
+        address_frequency,
+        number_frequency
+    ) = build_indexes(
+        s2,
+        s3
     )
 
-    print(
-        "Useful name tokens:",
-        len(useful_name_tokens)
+    # --------------------------------------------------------
+    # COUNTRY LOOKUPS
+    # --------------------------------------------------------
+
+    s2_countries, s3_countries = build_country_sets(
+        s2,
+        s3
     )
 
-    for source, df in [("S2", s2), ("S3", s3)]:
+    # --------------------------------------------------------
+    # CREATE OUTPUT DIRECTORY
+    # --------------------------------------------------------
 
-        for idx, value in enumerate(df["business_name"]):
-
-            if not isinstance(value, str):
-                continue
-
-            tokens = set(get_tokens(normalize_name(value)))
-
-            for token in tokens:
-
-                if token in useful_name_tokens:
-                    name_index[token].append(
-                        (source, idx)
-                    )
-
-    # ----------------------------------------
-    # ADDRESS INDEX
-    # ----------------------------------------
-
-    print("\nBuilding address index...")
-
-    address_frequency = Counter()
-
-    for source, df in [("S2", s2), ("S3", s3)]:
-
-        for value in df["business_address"]:
-
-            if not isinstance(value, str):
-                continue
-
-            tokens = set(
-                get_tokens(
-                    normalize_address(value)
-                )
-            )
-
-            for token in tokens:
-                address_frequency[token] += 1
-
-    useful_address_tokens = {
-        token
-        for token, count in address_frequency.items()
-        if count <= MAX_BLOCK_SIZE
-    }
-
-    print(
-        "Total address tokens:",
-        len(address_frequency)
+    os.makedirs(
+        OUTPUT_DIR,
+        exist_ok=True
     )
 
-    print(
-        "Useful address tokens:",
-        len(useful_address_tokens)
-    )
+    # Remove old candidate file
+    if os.path.exists(CANDIDATE_FILE):
 
-    address_index = defaultdict(list)
+        os.remove(
+            CANDIDATE_FILE
+        )
 
-    for source, df in [("S2", s2), ("S3", s3)]:
+    # --------------------------------------------------------
+    # WRITE HEADER
+    # --------------------------------------------------------
 
-        for idx, value in enumerate(df["business_address"]):
+    with open(
+        CANDIDATE_FILE,
+        "w",
+        encoding="utf-8"
+    ) as f:
 
-            if not isinstance(value, str):
-                continue
+        f.write(
+            "source1_entity_id\tcandidate_entity_id\n"
+        )
 
-            tokens = set(
-                get_tokens(
-                    normalize_address(value)
-                )
-            )
+    # --------------------------------------------------------
+    # PROCESS ALL S1
+    # --------------------------------------------------------
 
-            for token in tokens:
+    print("\n" + "=" * 70)
+    print("GENERATING CANDIDATES FOR ALL S1")
+    print("=" * 70)
 
-                if token in useful_address_tokens:
-                    address_index[token].append(
-                        (source, idx)
-                    )
+    total_pairs = 0
 
-    # ----------------------------------------
-    # NUMBER INDEX
-    # ----------------------------------------
+    buffer = []
 
-    print("\nBuilding number index...")
+    BUFFER_SIZE = 100000
 
-    number_frequency = Counter()
-
-    for source, df in [("S2", s2), ("S3", s3)]:
-
-        for value in df["business_address"]:
-
-            if not isinstance(value, str):
-                continue
-
-            for number in set(extract_numbers(value)):
-                number_frequency[number] += 1
-
-    useful_numbers = {
-        number
-        for number, count in number_frequency.items()
-        if count <= MAX_BLOCK_SIZE
-    }
-
-    number_index = defaultdict(list)
-
-    for source, df in [("S2", s2), ("S3", s3)]:
-
-        for idx, value in enumerate(df["business_address"]):
-
-            if not isinstance(value, str):
-                continue
-
-            for number in set(extract_numbers(value)):
-
-                if number in useful_numbers:
-                    number_index[number].append(
-                        (source, idx)
-                    )
-
-    print(
-        "Useful numbers:",
-        len(useful_numbers)
-    )
-
-    # ----------------------------------------
-    # TEST BLOCKING
-    # ----------------------------------------
-
-    print("\n" + "=" * 60)
-    print("TESTING BLOCKING V2")
-    print("=" * 60)
-
-    # Use same 20k sample as V1
-    sample = s1.sample(
-        n=20000,
-        random_state=42
-    )
-
-    candidate_counts = []
+    total_s1 = len(s1)
 
     for count, (_, row) in enumerate(
-        sample.iterrows(),
+        s1.iterrows(),
         start=1
     ):
 
         candidates = get_candidates(
             row,
-            s2,
-            s3,
-            name_index,
-            address_index,
-            number_index
+            name_pair_index,
+            address_pair_index,
+            number_address_index,
+            name_single_index,
+            address_single_index,
+            name_frequency,
+            address_frequency,
+            number_frequency,
+            s2_countries,
+            s3_countries
         )
 
-        candidate_counts.append(len(candidates))
+        s1_id = row["entity_id"]
 
-        if count % 1000 == 0:
-            print(
-                f"Processed {count:,}/20,000"
+        for source, idx in candidates:
+
+            if source == "S2":
+
+                target_id = s2.iloc[idx]["entity_id"]
+
+            else:
+
+                target_id = s3.iloc[idx]["entity_id"]
+
+            buffer.append(
+                f"{s1_id}\t{target_id}\n"
             )
 
-    candidate_counts = np.array(candidate_counts)
+        total_pairs += len(candidates)
 
-    print("\nRESULTS")
-    print("-" * 60)
+        # ----------------------------------------------------
+        # WRITE BUFFER
+        # ----------------------------------------------------
+
+        if len(buffer) >= BUFFER_SIZE:
+
+            with open(
+                CANDIDATE_FILE,
+                "a",
+                encoding="utf-8"
+            ) as f:
+
+                f.writelines(buffer)
+
+            buffer.clear()
+
+        # ----------------------------------------------------
+        # PROGRESS
+        # ----------------------------------------------------
+
+        if count % 10000 == 0:
+
+            avg = total_pairs / count
+
+            print(
+                f"Processed {count:,}/{total_s1:,} "
+                f"({count / total_s1 * 100:.2f}%) | "
+                f"Pairs: {total_pairs:,} | "
+                f"Avg candidates/S1: {avg:,.2f}"
+            )
+
+    # --------------------------------------------------------
+    # WRITE REMAINING BUFFER
+    # --------------------------------------------------------
+
+    if buffer:
+
+        with open(
+            CANDIDATE_FILE,
+            "a",
+            encoding="utf-8"
+        ) as f:
+
+            f.writelines(buffer)
+
+    # --------------------------------------------------------
+    # FINAL RESULTS
+    # --------------------------------------------------------
+
+    print("\n" + "=" * 70)
+    print("BLOCKING COMPLETE")
+    print("=" * 70)
 
     print(
-        "Average candidates:",
-        f"{candidate_counts.mean():,.2f}"
+        "S1 processed:",
+        f"{total_s1:,}"
     )
 
     print(
-        "Median candidates:",
-        f"{np.median(candidate_counts):,.2f}"
+        "Total candidate pairs:",
+        f"{total_pairs:,}"
     )
 
     print(
-        "90th percentile:",
-        f"{np.percentile(candidate_counts, 90):,.2f}"
+        "Average candidates/S1:",
+        f"{total_pairs / total_s1:,.2f}"
     )
 
     print(
-        "95th percentile:",
-        f"{np.percentile(candidate_counts, 95):,.2f}"
-    )
-
-    print(
-        "99th percentile:",
-        f"{np.percentile(candidate_counts, 99):,.2f}"
-    )
-
-    print(
-        "Maximum:",
-        f"{candidate_counts.max():,}"
+        "Output file:",
+        os.path.abspath(CANDIDATE_FILE)
     )
 
 
