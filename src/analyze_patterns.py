@@ -1,42 +1,78 @@
 import pandas as pd
-from collections import defaultdict
-import random
-
-from preprocessing import (
-    normalize_name,
-    normalize_address,
-    extract_numbers,
-)
+import re
+import unicodedata
+from pathlib import Path
 
 
 # ============================================================
-# FILE PATHS
+# ROBUST FILE PATHS
 # ============================================================
 
-SOURCE1 = "../dataset/train/train_source1.tsv"
-SOURCE2 = "../dataset/train/train_source2.tsv"
-SOURCE3 = "../dataset/train/train_source3.tsv"
-GROUND_TRUTH = "../dataset/train/train_ground_truth.tsv"
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Your current project has:
+# AmazonMLChallenge/
+#   datasets/student_resource/dataset/
+# If your dataset is directly under AmazonMLChallenge/dataset/,
+# the fallback below handles that too.
+DATASET_ROOT = PROJECT_ROOT / "datasets" / "student_resource" / "dataset"
+
+if not DATASET_ROOT.exists():
+    DATASET_ROOT = PROJECT_ROOT / "dataset"
+
+TRAIN_DIR = DATASET_ROOT / "train"
+
+GROUND_TRUTH = TRAIN_DIR / "train_ground_truth.tsv"
+SOURCE1 = TRAIN_DIR / "train_source1.tsv"
+SOURCE2 = TRAIN_DIR / "train_source2.tsv"
+SOURCE3 = TRAIN_DIR / "train_source3.tsv"
 
 
 # ============================================================
-# CONFIGURATION
+# NORMALIZATION
 # ============================================================
 
-# Number of S1 records used for evaluation.
-# 20,000 gives us a useful estimate without processing
-# all 2.2 million records.
-SAMPLE_SIZE = 20_000
+def normalize_text(text):
+    if pd.isna(text):
+        return ""
 
-RANDOM_SEED = 42
+    text = str(text).lower()
+    text = unicodedata.normalize("NFKD", text)
+
+    text = "".join(
+        c for c in text
+        if not unicodedata.combining(c)
+    )
+
+    text = re.sub(r"[^\w\s]", " ", text, flags=re.UNICODE)
+    text = re.sub(r"\s+", " ", text).strip()
+
+    return text
+
+
+def token_set(text):
+    return set(normalize_text(text).split())
+
+
+def jaccard_from_normalized(a, b):
+    """Jaccard using already-normalized strings."""
+    if not a or not b:
+        return 0.0
+
+    a_tokens = set(a.split())
+    b_tokens = set(b.split())
+
+    if not a_tokens or not b_tokens:
+        return 0.0
+
+    return len(a_tokens & b_tokens) / len(a_tokens | b_tokens)
 
 
 # ============================================================
-# LOAD SOURCE DATA
+# LOAD DATA
 # ============================================================
 
 def load_source(path):
-
     return pd.read_csv(
         path,
         sep="\t",
@@ -49,555 +85,423 @@ def load_source(path):
     )
 
 
-# ============================================================
-# BUILD BLOCKING INDEX
-# ============================================================
-
-def build_index(df):
-
+def build_record_lookup(df):
     """
-    Build country-specific inverted indexes.
+    Convert the dataframe into dictionaries once.
 
-    Example:
-
-        name_index["us"]["payne"]
-            -> {S2-123, S3-456}
-
-        address_index["us"]["peoria"]
-            -> {S2-123, S3-900}
-
-        number_index["us"]["3315"]
-            -> {S2-123}
-
-    Country is used as a filter.
-
-    Country itself NEVER creates candidates.
+    This avoids repeatedly doing:
+        source.loc[entity_id]
+    for every ground-truth match.
     """
+    lookup = {}
 
-    name_index = defaultdict(
-        lambda: defaultdict(set)
-    )
+    for row in df.itertuples(index=False):
+        lookup[row.entity_id] = {
+            "business_name": row.business_name,
+            "business_address": row.business_address,
+            "country": row.country,
+        }
 
-    address_index = defaultdict(
-        lambda: defaultdict(set)
-    )
+    return lookup
 
-    number_index = defaultdict(
-        lambda: defaultdict(set)
-    )
 
-    total = len(df)
+# ============================================================
+# NAME PATTERNS
+# ============================================================
 
-    print("\nBuilding indexes...")
+def analyze_name_patterns(s1, s2, s3, ground_truth):
+    print("\n" + "=" * 70)
+    print("NAME MATCHING PATTERNS")
+    print("=" * 70)
 
-    for count, row in enumerate(
-        df.itertuples(index=False),
-        start=1
-    ):
+    # Precompute normalized names ONCE.
+    print("Preparing name lookup tables...")
 
-        entity_id = row.entity_id
-
-        if pd.isna(row.country):
-            continue
-
-        country = str(
-            row.country
-        ).strip().lower()
-
-        if not country:
-            continue
-
-        # ----------------------------------------------------
-        # NAME
-        # ----------------------------------------------------
-
-        name = normalize_name(
-            row.business_name
-        )
-
-        if name:
-
-            for token in set(name.split()):
-
-                if len(token) >= 2:
-
-                    name_index[country][token].add(
-                        entity_id
-                    )
-
-        # ----------------------------------------------------
-        # ADDRESS
-        # ----------------------------------------------------
-
-        address = normalize_address(
-            row.business_address
-        )
-
-        if address:
-
-            for token in set(address.split()):
-
-                if len(token) >= 2:
-
-                    address_index[country][token].add(
-                        entity_id
-                    )
-
-        # ----------------------------------------------------
-        # NUMBERS
-        # ----------------------------------------------------
-
-        numbers = extract_numbers(
-            row.business_address
-        )
-
-        for number in numbers:
-
-            number_index[country][number].add(
-                entity_id
-            )
-
-        # Progress
-        if count % 500_000 == 0:
-
-            print(
-                f"Indexed: {count:,} / {total:,}"
-            )
-
-    return {
-        "name": name_index,
-        "address": address_index,
-        "number": number_index,
+    s1_names = {
+        entity_id: normalize_text(record["business_name"])
+        for entity_id, record in s1.items()
     }
 
+    s2_names = {
+        entity_id: normalize_text(record["business_name"])
+        for entity_id, record in s2.items()
+    }
 
-# ============================================================
-# GENERATE CANDIDATES
-# ============================================================
+    s3_names = {
+        entity_id: normalize_text(record["business_name"])
+        for entity_id, record in s3.items()
+    }
 
-def generate_candidates(
-    row,
-    indexes
-):
+    total_matches = 0
+    exact = 0
+    high_similarity = 0
+    low_similarity = 0
+    empty_name = 0
 
-    """
-    Generate candidates for one S1 record.
+    examples = []
+    total_rows = len(ground_truth)
 
-    Candidate requirements:
+    print(f"Analyzing {total_rows:,} ground-truth rows...")
 
-        SAME COUNTRY
-        AND
-        shared name/address/number evidence
-    """
-
-    if pd.isna(row.country):
-        return set()
-
-    country = str(
-        row.country
-    ).strip().lower()
-
-    candidates = set()
-
-    # --------------------------------------------------------
-    # NAME BLOCK
-    # --------------------------------------------------------
-
-    name = normalize_name(
-        row.business_name
-    )
-
-    if name:
-
-        for token in set(name.split()):
-
-            if len(token) < 2:
-                continue
-
-            candidates.update(
-                indexes["name"][country].get(
-                    token,
-                    set()
-                )
-            )
-
-    # --------------------------------------------------------
-    # ADDRESS BLOCK
-    # --------------------------------------------------------
-
-    address = normalize_address(
-        row.business_address
-    )
-
-    if address:
-
-        for token in set(address.split()):
-
-            if len(token) < 2:
-                continue
-
-            candidates.update(
-                indexes["address"][country].get(
-                    token,
-                    set()
-                )
-            )
-
-    # --------------------------------------------------------
-    # NUMBER BLOCK
-    # --------------------------------------------------------
-
-    numbers = extract_numbers(
-        row.business_address
-    )
-
-    for number in numbers:
-
-        candidates.update(
-            indexes["number"][country].get(
-                number,
-                set()
-            )
-        )
-
-    return candidates
-
-
-# ============================================================
-# LOAD GROUND TRUTH
-# ============================================================
-
-def load_ground_truth():
-
-    return pd.read_csv(
-        GROUND_TRUTH,
-        sep="\t",
-        usecols=[
-            "source1_entity_id",
-            "matched_entity_ids",
-        ],
-    )
-
-
-# ============================================================
-# CREATE SAMPLE
-# ============================================================
-
-def create_sample(
-    s1,
-    ground_truth
-):
-
-    """
-    Select a random sample of S1 records.
-
-    We use a fixed random seed so that every run
-    evaluates the same records.
-    """
-
-    random.seed(
-        RANDOM_SEED
-    )
-
-    available_ids = set(
-        ground_truth[
-            "source1_entity_id"
-        ]
-    )
-
-    sample_size = min(
-        SAMPLE_SIZE,
-        len(available_ids)
-    )
-
-    sampled_ids = random.sample(
-        list(available_ids),
-        sample_size
-    )
-
-    sampled_ids = set(
-        sampled_ids
-    )
-
-    sample_s1 = s1[
-        s1["entity_id"].isin(
-            sampled_ids
-        )
-    ].copy()
-
-    sample_ground_truth = ground_truth[
-        ground_truth[
-            "source1_entity_id"
-        ].isin(
-            sampled_ids
-        )
-    ].copy()
-
-    return (
-        sample_s1,
-        sample_ground_truth
-    )
-
-
-# ============================================================
-# CONVERT GROUND TRUTH TO DICTIONARY
-# ============================================================
-
-def build_truth_dictionary(
-    ground_truth
-):
-
-    truth = {}
-
-    for row in ground_truth.itertuples(
-        index=False
+    for count, row in enumerate(
+        ground_truth.itertuples(index=False),
+        start=1
     ):
-
         s1_id = row.source1_entity_id
         matched = row.matched_entity_ids
 
-        if pd.isna(matched):
-
-            truth[s1_id] = set()
-
+        if pd.isna(matched) or not str(matched).strip():
             continue
 
-        matched = str(
-            matched
-        ).strip()
+        normalized_s1 = s1_names.get(s1_id, "")
 
-        if not matched:
+        for match_id in str(matched).split(","):
+            match_id = match_id.strip()
 
-            truth[s1_id] = set()
+            if not match_id:
+                continue
 
-            continue
+            if match_id.startswith("S2-"):
+                normalized_target = s2_names.get(match_id, "")
+            elif match_id.startswith("S3-"):
+                normalized_target = s3_names.get(match_id, "")
+            else:
+                continue
 
-        truth[s1_id] = {
-            x.strip()
-            for x in matched.split(",")
-            if x.strip()
-        }
+            total_matches += 1
 
-    return truth
+            if not normalized_target:
+                empty_name += 1
+                continue
 
+            if normalized_s1 == normalized_target:
+                exact += 1
 
-# ============================================================
-# EVALUATE BLOCKING
-# ============================================================
+            sim = jaccard_from_normalized(
+                normalized_s1,
+                normalized_target
+            )
 
-def evaluate_blocking(
-    sample_s1,
-    truth,
-    indexes
-):
+            if sim >= 0.5:
+                high_similarity += 1
 
-    print("\n")
-    print("=" * 70)
-    print("BLOCKING EVALUATION")
-    print("=" * 70)
+            if sim < 0.3:
+                low_similarity += 1
 
-    total_true_matches = 0
-    found_true_matches = 0
-    missed_true_matches = 0
+                if len(examples) < 15:
+                    # Retrieve original values only for the few examples.
+                    if s1_id in s1:
+                        original_s1 = s1[s1_id]["business_name"]
+                    else:
+                        original_s1 = ""
 
-    candidate_counts = []
+                    if match_id.startswith("S2-"):
+                        original_target = s2.get(
+                            match_id, {}
+                        ).get("business_name", "")
+                    else:
+                        original_target = s3.get(
+                            match_id, {}
+                        ).get("business_name", "")
 
-    missed_examples = []
+                    examples.append(
+                        (
+                            original_s1,
+                            original_target,
+                            sim,
+                        )
+                    )
 
-    total_records = len(
-        sample_s1
+        # Progress indicator so the terminal never appears frozen.
+        if count % 100_000 == 0:
+            print(
+                f"Processed ground-truth rows: "
+                f"{count:,} / {total_rows:,}"
+            )
+
+    print(
+        f"\nTotal ground-truth matches analyzed : "
+        f"{total_matches:,}"
     )
+
+    print(
+        f"Exact normalized name matches       : "
+        f"{exact:,}"
+    )
+
+    print(
+        f"Name Jaccard >= 0.50                : "
+        f"{high_similarity:,}"
+    )
+
+    print(
+        f"Name Jaccard < 0.30                 : "
+        f"{low_similarity:,}"
+    )
+
+    print(
+        f"Missing target names                : "
+        f"{empty_name:,}"
+    )
+
+    if total_matches:
+        print("\nPercentages:")
+
+        print(
+            f"Exact name match       : "
+            f"{exact / total_matches * 100:.2f}%"
+        )
+
+        print(
+            f"Jaccard >= 0.50        : "
+            f"{high_similarity / total_matches * 100:.2f}%"
+        )
+
+        print(
+            f"Jaccard < 0.30         : "
+            f"{low_similarity / total_matches * 100:.2f}%"
+        )
+
+    print("\nExamples where name similarity is LOW:")
+    print("-" * 70)
+
+    for name1, name2, sim in examples:
+        print(f"S1 : {name1}")
+        print(f"S2 : {name2}")
+        print(f"Jaccard: {sim:.3f}")
+        print()
+
+
+# ============================================================
+# ADDRESS PATTERNS
+# ============================================================
+
+def analyze_address_patterns(s1, s2, s3, ground_truth):
+    print("\n" + "=" * 70)
+    print("ADDRESS MATCHING PATTERNS")
+    print("=" * 70)
+
+    print("Preparing address lookup tables...")
+
+    s1_addresses = {
+        entity_id: normalize_text(record["business_address"])
+        for entity_id, record in s1.items()
+    }
+
+    s2_addresses = {
+        entity_id: normalize_text(record["business_address"])
+        for entity_id, record in s2.items()
+    }
+
+    s3_addresses = {
+        entity_id: normalize_text(record["business_address"])
+        for entity_id, record in s3.items()
+    }
+
+    total = 0
+    both_present = 0
+    high_similarity = 0
+    low_similarity = 0
+
+    examples = []
+    total_rows = len(ground_truth)
+
+    print(f"Analyzing {total_rows:,} ground-truth rows...")
 
     for count, row in enumerate(
-        sample_s1.itertuples(index=False),
+        ground_truth.itertuples(index=False),
         start=1
     ):
+        s1_id = row.source1_entity_id
+        matched = row.matched_entity_ids
 
-        candidates = generate_candidates(
-            row,
-            indexes
-        )
+        if pd.isna(matched) or not str(matched).strip():
+            continue
 
-        candidate_count = len(
-            candidates
-        )
+        address1 = s1_addresses.get(s1_id, "")
+        total_for_row = 0
 
-        candidate_counts.append(
-            candidate_count
-        )
+        for match_id in str(matched).split(","):
+            match_id = match_id.strip()
 
-        true_matches = truth.get(
-            row.entity_id,
-            set()
-        )
+            if not match_id:
+                continue
 
-        total_true_matches += len(
-            true_matches
-        )
+            if match_id.startswith("S2-"):
+                address2 = s2_addresses.get(match_id, "")
+            elif match_id.startswith("S3-"):
+                address2 = s3_addresses.get(match_id, "")
+            else:
+                continue
 
-        found = (
-            true_matches &
-            candidates
-        )
+            total += 1
 
-        missed = (
-            true_matches -
-            candidates
-        )
+            if not address1 or not address2:
+                continue
 
-        found_true_matches += len(
-            found
-        )
+            both_present += 1
 
-        missed_true_matches += len(
-            missed
-        )
-
-        # Store a few examples for debugging.
-        if missed and len(
-            missed_examples
-        ) < 15:
-
-            missed_examples.append(
-                {
-                    "s1_id": row.entity_id,
-                    "name": row.business_name,
-                    "address": row.business_address,
-                    "missed": list(missed)[:5],
-                }
+            sim = jaccard_from_normalized(
+                address1,
+                address2
             )
 
-        if count % 2_000 == 0:
+            if sim >= 0.5:
+                high_similarity += 1
 
+            if sim < 0.3:
+                low_similarity += 1
+
+                if len(examples) < 15:
+                    original_s1 = s1.get(
+                        s1_id, {}
+                    ).get("business_address", "")
+
+                    if match_id.startswith("S2-"):
+                        original_target = s2.get(
+                            match_id, {}
+                        ).get("business_address", "")
+                    else:
+                        original_target = s3.get(
+                            match_id, {}
+                        ).get("business_address", "")
+
+                    examples.append(
+                        (
+                            original_s1,
+                            original_target,
+                            sim,
+                        )
+                    )
+
+        if count % 100_000 == 0:
             print(
-                f"Evaluated: "
-                f"{count:,} / "
-                f"{total_records:,}"
+                f"Processed ground-truth rows: "
+                f"{count:,} / {total_rows:,}"
             )
 
-    # ========================================================
-    # RESULTS
-    # ========================================================
-
-    if total_true_matches > 0:
-
-        recall = (
-            found_true_matches /
-            total_true_matches
-        )
-
-    else:
-
-        recall = 0.0
-
-    candidate_series = pd.Series(
-        candidate_counts
-    )
-
-    print("\n")
-    print("=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-
     print(
-        f"Sample S1 records       : "
-        f"{total_records:,}"
+        f"\nTotal matches                  : "
+        f"{total:,}"
     )
 
     print(
-        f"True matches            : "
-        f"{total_true_matches:,}"
+        f"Both addresses present        : "
+        f"{both_present:,}"
     )
 
     print(
-        f"Found by blocking       : "
-        f"{found_true_matches:,}"
+        f"Address Jaccard >= 0.50       : "
+        f"{high_similarity:,}"
     )
 
     print(
-        f"Missed by blocking      : "
-        f"{missed_true_matches:,}"
+        f"Address Jaccard < 0.30        : "
+        f"{low_similarity:,}"
     )
 
-    print(
-        f"Blocking recall         : "
-        f"{recall * 100:.4f}%"
-    )
-
-    print("\n")
-    print("=" * 70)
-    print("CANDIDATE STATISTICS")
-    print("=" * 70)
-
-    print(
-        f"Average candidates/S1   : "
-        f"{candidate_series.mean():.2f}"
-    )
-
-    print(
-        f"Median candidates/S1    : "
-        f"{candidate_series.median():.2f}"
-    )
-
-    print(
-        f"90th percentile         : "
-        f"{candidate_series.quantile(0.90):.2f}"
-    )
-
-    print(
-        f"95th percentile         : "
-        f"{candidate_series.quantile(0.95):.2f}"
-    )
-
-    print(
-        f"99th percentile         : "
-        f"{candidate_series.quantile(0.99):.2f}"
-    )
-
-    print(
-        f"Maximum candidates      : "
-        f"{candidate_series.max():,}"
-    )
-
-    # ========================================================
-    # MISSED MATCH EXAMPLES
-    # ========================================================
-
-    if missed_examples:
-
-        print("\n")
-        print("=" * 70)
-        print("MISSED TRUE MATCH EXAMPLES")
-        print("=" * 70)
-
-        for example in missed_examples:
-
-            print(
-                f"\nS1 ID: "
-                f"{example['s1_id']}"
-            )
-
-            print(
-                f"Name: "
-                f"{example['name']}"
-            )
-
-            print(
-                f"Address: "
-                f"{example['address']}"
-            )
-
-            print(
-                f"Missed target IDs: "
-                f"{example['missed']}"
-            )
-
-    else:
-
-        print("\n")
+    if both_present:
         print(
-            "No missed true matches "
-            "in the sample."
+            "\nPercentages among pairs "
+            "with both addresses:"
+        )
+
+        print(
+            f"Jaccard >= 0.50 : "
+            f"{high_similarity / both_present * 100:.2f}%"
+        )
+
+        print(
+            f"Jaccard < 0.30  : "
+            f"{low_similarity / both_present * 100:.2f}%"
+        )
+
+    print("\nExamples where address similarity is LOW:")
+    print("-" * 70)
+
+    for address1, address2, sim in examples:
+        print(f"S1 : {address1}")
+        print(f"S2 : {address2}")
+        print(f"Jaccard: {sim:.3f}")
+        print()
+
+
+# ============================================================
+# COUNTRY
+# ============================================================
+
+def analyze_country(s1, s2, s3, ground_truth):
+    print("\n" + "=" * 70)
+    print("COUNTRY CONSISTENCY")
+    print("=" * 70)
+
+    s1_countries = {
+        entity_id: record["country"]
+        for entity_id, record in s1.items()
+    }
+
+    s2_countries = {
+        entity_id: record["country"]
+        for entity_id, record in s2.items()
+    }
+
+    s3_countries = {
+        entity_id: record["country"]
+        for entity_id, record in s3.items()
+    }
+
+    total = 0
+    same_country = 0
+    different_country = 0
+
+    for row in ground_truth.itertuples(index=False):
+        s1_id = row.source1_entity_id
+        matched = row.matched_entity_ids
+
+        if pd.isna(matched) or not str(matched).strip():
+            continue
+
+        country1 = s1_countries.get(s1_id)
+
+        for match_id in str(matched).split(","):
+            match_id = match_id.strip()
+
+            if match_id.startswith("S2-"):
+                country2 = s2_countries.get(match_id)
+            elif match_id.startswith("S3-"):
+                country2 = s3_countries.get(match_id)
+            else:
+                continue
+
+            if pd.isna(country1) or pd.isna(country2):
+                continue
+
+            total += 1
+
+            if str(country1).upper() == str(country2).upper():
+                same_country += 1
+            else:
+                different_country += 1
+
+    print(
+        f"Total matched pairs       : "
+        f"{total:,}"
+    )
+
+    print(
+        f"Same country              : "
+        f"{same_country:,}"
+    )
+
+    print(
+        f"Different country         : "
+        f"{different_country:,}"
+    )
+
+    if total:
+        print(
+            f"\nCountry agreement: "
+            f"{same_country / total * 100:.2f}%"
         )
 
 
@@ -606,164 +510,87 @@ def evaluate_blocking(
 # ============================================================
 
 def main():
-
     print("=" * 70)
-    print("OPTIMIZED BLOCKING TEST")
+    print("OPTIMIZED MATCHING PATTERN ANALYSIS")
     print("=" * 70)
 
-    # --------------------------------------------------------
-    # Load S1
-    # --------------------------------------------------------
+    print(f"\nDataset folder: {DATASET_ROOT}")
 
-    print("\nLoading Source 1...")
+    required_files = [
+        SOURCE1,
+        SOURCE2,
+        SOURCE3,
+        GROUND_TRUTH,
+    ]
 
-    s1 = load_source(
-        SOURCE1
+    for path in required_files:
+        if not path.exists():
+            raise FileNotFoundError(
+                f"\nRequired file not found:\n{path}\n"
+                f"\nExpected dataset structure:\n"
+                f"{PROJECT_ROOT}\\datasets\\student_resource\\dataset\\train\\"
+            )
+
+    print("\nLoading training data...")
+
+    s1_df = load_source(SOURCE1)
+    print(f"Source 1 loaded: {len(s1_df):,}")
+
+    s2_df = load_source(SOURCE2)
+    print(f"Source 2 loaded: {len(s2_df):,}")
+
+    s3_df = load_source(SOURCE3)
+    print(f"Source 3 loaded: {len(s3_df):,}")
+
+    ground_truth = pd.read_csv(
+        GROUND_TRUTH,
+        sep="\t",
+        usecols=[
+            "source1_entity_id",
+            "matched_entity_ids",
+        ],
     )
 
     print(
-        f"Source 1 records: "
-        f"{len(s1):,}"
-    )
-
-    # --------------------------------------------------------
-    # Load ground truth FIRST
-    # --------------------------------------------------------
-
-    print("\nLoading ground truth...")
-
-    ground_truth = load_ground_truth()
-
-    print(
-        f"Ground truth records: "
+        f"Ground truth loaded: "
         f"{len(ground_truth):,}"
     )
 
-    # --------------------------------------------------------
-    # Select sample
-    # --------------------------------------------------------
+    print("\nBuilding fast record lookups...")
 
-    print(
-        f"\nSelecting "
-        f"{SAMPLE_SIZE:,} S1 records..."
-    )
+    s1 = build_record_lookup(s1_df)
+    s2 = build_record_lookup(s2_df)
+    s3 = build_record_lookup(s3_df)
 
-    (
-        sample_s1,
-        sample_ground_truth
-    ) = create_sample(
+    del s1_df, s2_df, s3_df
+
+    print("Lookups ready.")
+
+    # Run analyses one at a time.
+    analyze_name_patterns(
         s1,
-        ground_truth
+        s2,
+        s3,
+        ground_truth,
     )
 
-    print(
-        f"Sample selected: "
-        f"{len(sample_s1):,}"
+    analyze_address_patterns(
+        s1,
+        s2,
+        s3,
+        ground_truth,
     )
 
-    # We no longer need the full S1.
-    del s1
-
-    # --------------------------------------------------------
-    # Build truth dictionary
-    # --------------------------------------------------------
-
-    truth = build_truth_dictionary(
-        sample_ground_truth
+    analyze_country(
+        s1,
+        s2,
+        s3,
+        ground_truth,
     )
 
-    del sample_ground_truth
-    del ground_truth
-
-    print(
-        "Sample ground truth prepared."
-    )
-
-    # --------------------------------------------------------
-    # Load S2
-    # --------------------------------------------------------
-
-    print("\nLoading Source 2...")
-
-    s2 = load_source(
-        SOURCE2
-    )
-
-    print(
-        f"Source 2 records: "
-        f"{len(s2):,}"
-    )
-
-    # --------------------------------------------------------
-    # Load S3
-    # --------------------------------------------------------
-
-    print("\nLoading Source 3...")
-
-    s3 = load_source(
-        SOURCE3
-    )
-
-    print(
-        f"Source 3 records: "
-        f"{len(s3):,}"
-    )
-
-    # --------------------------------------------------------
-    # Combine targets
-    # --------------------------------------------------------
-
-    print("\nCombining S2 + S3...")
-
-    targets = pd.concat(
-        [s2, s3],
-        ignore_index=True
-    )
-
-    print(
-        f"Target records: "
-        f"{len(targets):,}"
-    )
-
-    del s2
-    del s3
-
-    # --------------------------------------------------------
-    # Build indexes
-    # --------------------------------------------------------
-
-    indexes = build_index(
-        targets
-    )
-
-    del targets
-
-    print("\nIndexes built successfully.")
-
-    print(
-        f"Name countries: "
-        f"{len(indexes['name']):,}"
-    )
-
-    print(
-        f"Address countries: "
-        f"{len(indexes['address']):,}"
-    )
-
-    print(
-        f"Number countries: "
-        f"{len(indexes['number']):,}"
-    )
-
-    # --------------------------------------------------------
-    # Evaluate
-    # --------------------------------------------------------
-
-    evaluate_blocking(
-        sample_s1,
-        truth,
-        indexes
-    )
+    print("\n" + "=" * 70)
+    print("ANALYSIS COMPLETE")
+    print("=" * 70)
 
 
 if __name__ == "__main__":

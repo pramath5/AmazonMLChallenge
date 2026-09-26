@@ -12,8 +12,7 @@ env/
 .ipynb_checkpoints/
 
 # Challenge dataset
-dataset/
-
+datasets/
 # Generated outputs
 output/
 

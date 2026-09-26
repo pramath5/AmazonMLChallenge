@@ -1,768 +1,437 @@
 import pandas as pd
-from collections import defaultdict
-import random
+import numpy as np
+from collections import defaultdict, Counter
 
 from preprocessing import (
     normalize_name,
     normalize_address,
-    extract_numbers,
+    get_tokens,
+    extract_numbers
 )
 
 
-# ============================================================
-# FILE PATHS
-# ============================================================
-
-SOURCE1 = "../dataset/train/train_source1.tsv"
-SOURCE2 = "../dataset/train/train_source2.tsv"
-SOURCE3 = "../dataset/train/train_source3.tsv"
-GROUND_TRUTH = "../dataset/train/train_ground_truth.tsv"
+S1_FILE = "../dataset/train/train_source1.tsv"
+S2_FILE = "../dataset/train/train_source2.tsv"
+S3_FILE = "../dataset/train/train_source3.tsv"
 
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-# Number of S1 records used for evaluation.
-# 20,000 gives us a useful estimate without processing
-# all 2.2 million records.
-SAMPLE_SIZE = 20_000
-
-RANDOM_SEED = 42
+# Maximum number of target records allowed in a block.
+# Tokens occurring more often than this are ignored.
+MAX_BLOCK_SIZE = 5000
 
 
-# ============================================================
-# LOAD SOURCE DATA
-# ============================================================
+def build_index(df, field, max_block_size=MAX_BLOCK_SIZE):
 
-def load_source(path):
+    index = defaultdict(list)
 
-    return pd.read_csv(
-        path,
-        sep="\t",
-        usecols=[
-            "entity_id",
-            "business_name",
-            "business_address",
-            "country",
-        ],
-    )
+    frequencies = Counter()
 
+    print(f"Building frequency index for {field}...")
 
-# ============================================================
-# BUILD BLOCKING INDEX
-# ============================================================
+    # First calculate token frequencies
+    for value in df[field]:
 
-def build_index(df):
-
-    """
-    Build country-specific inverted indexes.
-
-    Example:
-
-        name_index["us"]["payne"]
-            -> {S2-123, S3-456}
-
-        address_index["us"]["peoria"]
-            -> {S2-123, S3-900}
-
-        number_index["us"]["3315"]
-            -> {S2-123}
-
-    Country is used as a filter.
-
-    Country itself NEVER creates candidates.
-    """
-
-    name_index = defaultdict(
-        lambda: defaultdict(set)
-    )
-
-    address_index = defaultdict(
-        lambda: defaultdict(set)
-    )
-
-    number_index = defaultdict(
-        lambda: defaultdict(set)
-    )
-
-    total = len(df)
-
-    print("\nBuilding indexes...")
-
-    for count, row in enumerate(
-        df.itertuples(index=False),
-        start=1
-    ):
-
-        entity_id = row.entity_id
-
-        if pd.isna(row.country):
+        if not isinstance(value, str):
             continue
 
-        country = str(
-            row.country
-        ).strip().lower()
+        tokens = get_tokens(value)
 
-        if not country:
+        # Count each token only once per record
+        for token in set(tokens):
+            frequencies[token] += 1
+
+    print(f"Unique tokens: {len(frequencies):,}")
+
+    # Keep only selective tokens
+    useful_tokens = {
+        token
+        for token, count in frequencies.items()
+        if count <= max_block_size
+    }
+
+    print(
+        f"Useful tokens: {len(useful_tokens):,}"
+    )
+
+    # Build inverted index
+    for idx, value in enumerate(df[field]):
+
+        if not isinstance(value, str):
             continue
 
-        # ----------------------------------------------------
-        # NAME
-        # ----------------------------------------------------
+        tokens = set(get_tokens(value))
 
-        name = normalize_name(
-            row.business_name
-        )
+        for token in tokens:
 
-        if name:
+            if token in useful_tokens:
+                index[token].append(idx)
 
-            for token in set(name.split()):
+    return index, frequencies
 
-                if len(token) >= 2:
 
-                    name_index[country][token].add(
-                        entity_id
-                    )
+def build_number_index(df):
 
-        # ----------------------------------------------------
-        # ADDRESS
-        # ----------------------------------------------------
+    index = defaultdict(list)
 
-        address = normalize_address(
-            row.business_address
-        )
+    print("Building number index...")
 
-        if address:
+    for idx, value in enumerate(df["business_address"]):
 
-            for token in set(address.split()):
+        if not isinstance(value, str):
+            continue
 
-                if len(token) >= 2:
-
-                    address_index[country][token].add(
-                        entity_id
-                    )
-
-        # ----------------------------------------------------
-        # NUMBERS
-        # ----------------------------------------------------
-
-        numbers = extract_numbers(
-            row.business_address
-        )
+        numbers = set(extract_numbers(value))
 
         for number in numbers:
 
-            number_index[country][number].add(
-                entity_id
-            )
+            # Ignore extremely common numbers
+            index[number].append(idx)
 
-        # Progress
-        if count % 500_000 == 0:
-
-            print(
-                f"Indexed: {count:,} / {total:,}"
-            )
-
-    return {
-        "name": name_index,
-        "address": address_index,
-        "number": number_index,
-    }
+    return index
 
 
-# ============================================================
-# GENERATE CANDIDATES
-# ============================================================
-
-def generate_candidates(
-    row,
-    indexes
+def get_candidates(
+    s1_row,
+    s2,
+    s3,
+    name_index,
+    address_index,
+    number_index
 ):
-
-    """
-    Generate candidates for one S1 record.
-
-    Candidate requirements:
-
-        SAME COUNTRY
-        AND
-        shared name/address/number evidence
-    """
-
-    if pd.isna(row.country):
-        return set()
-
-    country = str(
-        row.country
-    ).strip().lower()
 
     candidates = set()
 
-    # --------------------------------------------------------
-    # NAME BLOCK
-    # --------------------------------------------------------
+    country = s1_row["country"]
 
-    name = normalize_name(
-        row.business_name
-    )
+    name = normalize_name(s1_row["business_name"])
+    address = normalize_address(s1_row["business_address"])
 
-    if name:
+    # -----------------------------
+    # NAME BLOCKING
+    # -----------------------------
 
-        for token in set(name.split()):
+    for token in set(get_tokens(name)):
 
-            if len(token) < 2:
-                continue
+        if token in name_index:
 
-            candidates.update(
-                indexes["name"][country].get(
-                    token,
-                    set()
-                )
-            )
+            for source, idx in name_index[token]:
 
-    # --------------------------------------------------------
-    # ADDRESS BLOCK
-    # --------------------------------------------------------
-
-    address = normalize_address(
-        row.business_address
-    )
-
-    if address:
-
-        for token in set(address.split()):
-
-            if len(token) < 2:
-                continue
-
-            candidates.update(
-                indexes["address"][country].get(
-                    token,
-                    set()
-                )
-            )
-
-    # --------------------------------------------------------
-    # NUMBER BLOCK
-    # --------------------------------------------------------
-
-    numbers = extract_numbers(
-        row.business_address
-    )
+                if source == "S2":
+                    candidates.add(("S2", idx))
+                else:
+                    candidates.add(("S3", idx))
 
-    for number in numbers:
-
-        candidates.update(
-            indexes["number"][country].get(
-                number,
-                set()
-            )
-        )
+    # -----------------------------
+    # ADDRESS BLOCKING
+    # -----------------------------
 
-    return candidates
+    for token in set(get_tokens(address)):
 
+        if token in address_index:
 
-# ============================================================
-# LOAD GROUND TRUTH
-# ============================================================
+            for source, idx in address_index[token]:
 
-def load_ground_truth():
+                if source == "S2":
+                    candidates.add(("S2", idx))
+                else:
+                    candidates.add(("S3", idx))
 
-    return pd.read_csv(
-        GROUND_TRUTH,
-        sep="\t",
-        usecols=[
-            "source1_entity_id",
-            "matched_entity_ids",
-        ],
-    )
+    # -----------------------------
+    # NUMBER BLOCKING
+    # -----------------------------
 
+    for number in set(extract_numbers(address)):
 
-# ============================================================
-# CREATE SAMPLE
-# ============================================================
+        if number in number_index:
 
-def create_sample(
-    s1,
-    ground_truth
-):
+            for source, idx in number_index[number]:
 
-    """
-    Select a random sample of S1 records.
+                if source == "S2":
+                    candidates.add(("S2", idx))
+                else:
+                    candidates.add(("S3", idx))
 
-    We use a fixed random seed so that every run
-    evaluates the same records.
-    """
+    # -----------------------------
+    # COUNTRY FILTER
+    # -----------------------------
 
-    random.seed(
-        RANDOM_SEED
-    )
+    filtered = set()
 
-    available_ids = set(
-        ground_truth[
-            "source1_entity_id"
-        ]
-    )
+    for source, idx in candidates:
 
-    sample_size = min(
-        SAMPLE_SIZE,
-        len(available_ids)
-    )
+        if source == "S2":
+            if s2.iloc[idx]["country"] == country:
+                filtered.add((source, idx))
 
-    sampled_ids = random.sample(
-        list(available_ids),
-        sample_size
-    )
+        else:
+            if s3.iloc[idx]["country"] == country:
+                filtered.add((source, idx))
 
-    sampled_ids = set(
-        sampled_ids
-    )
+    return filtered
 
-    sample_s1 = s1[
-        s1["entity_id"].isin(
-            sampled_ids
-        )
-    ].copy()
-
-    sample_ground_truth = ground_truth[
-        ground_truth[
-            "source1_entity_id"
-        ].isin(
-            sampled_ids
-        )
-    ].copy()
-
-    return (
-        sample_s1,
-        sample_ground_truth
-    )
-
-
-# ============================================================
-# CONVERT GROUND TRUTH TO DICTIONARY
-# ============================================================
-
-def build_truth_dictionary(
-    ground_truth
-):
-
-    truth = {}
-
-    for row in ground_truth.itertuples(
-        index=False
-    ):
-
-        s1_id = row.source1_entity_id
-        matched = row.matched_entity_ids
-
-        if pd.isna(matched):
-
-            truth[s1_id] = set()
-
-            continue
-
-        matched = str(
-            matched
-        ).strip()
-
-        if not matched:
-
-            truth[s1_id] = set()
-
-            continue
-
-        truth[s1_id] = {
-            x.strip()
-            for x in matched.split(",")
-            if x.strip()
-        }
-
-    return truth
-
-
-# ============================================================
-# EVALUATE BLOCKING
-# ============================================================
-
-def evaluate_blocking(
-    sample_s1,
-    truth,
-    indexes
-):
-
-    print("\n")
-    print("=" * 70)
-    print("BLOCKING EVALUATION")
-    print("=" * 70)
-
-    total_true_matches = 0
-    found_true_matches = 0
-    missed_true_matches = 0
-
-    candidate_counts = []
-
-    missed_examples = []
-
-    total_records = len(
-        sample_s1
-    )
-
-    for count, row in enumerate(
-        sample_s1.itertuples(index=False),
-        start=1
-    ):
-
-        candidates = generate_candidates(
-            row,
-            indexes
-        )
-
-        candidate_count = len(
-            candidates
-        )
-
-        candidate_counts.append(
-            candidate_count
-        )
-
-        true_matches = truth.get(
-            row.entity_id,
-            set()
-        )
-
-        total_true_matches += len(
-            true_matches
-        )
-
-        found = (
-            true_matches &
-            candidates
-        )
-
-        missed = (
-            true_matches -
-            candidates
-        )
-
-        found_true_matches += len(
-            found
-        )
-
-        missed_true_matches += len(
-            missed
-        )
-
-        # Store a few examples for debugging.
-        if missed and len(
-            missed_examples
-        ) < 15:
-
-            missed_examples.append(
-                {
-                    "s1_id": row.entity_id,
-                    "name": row.business_name,
-                    "address": row.business_address,
-                    "missed": list(missed)[:5],
-                }
-            )
-
-        if count % 2_000 == 0:
-
-            print(
-                f"Evaluated: "
-                f"{count:,} / "
-                f"{total_records:,}"
-            )
-
-    # ========================================================
-    # RESULTS
-    # ========================================================
-
-    if total_true_matches > 0:
-
-        recall = (
-            found_true_matches /
-            total_true_matches
-        )
-
-    else:
-
-        recall = 0.0
-
-    candidate_series = pd.Series(
-        candidate_counts
-    )
-
-    print("\n")
-    print("=" * 70)
-    print("RESULTS")
-    print("=" * 70)
-
-    print(
-        f"Sample S1 records       : "
-        f"{total_records:,}"
-    )
-
-    print(
-        f"True matches            : "
-        f"{total_true_matches:,}"
-    )
-
-    print(
-        f"Found by blocking       : "
-        f"{found_true_matches:,}"
-    )
-
-    print(
-        f"Missed by blocking      : "
-        f"{missed_true_matches:,}"
-    )
-
-    print(
-        f"Blocking recall         : "
-        f"{recall * 100:.4f}%"
-    )
-
-    print("\n")
-    print("=" * 70)
-    print("CANDIDATE STATISTICS")
-    print("=" * 70)
-
-    print(
-        f"Average candidates/S1   : "
-        f"{candidate_series.mean():.2f}"
-    )
-
-    print(
-        f"Median candidates/S1    : "
-        f"{candidate_series.median():.2f}"
-    )
-
-    print(
-        f"90th percentile         : "
-        f"{candidate_series.quantile(0.90):.2f}"
-    )
-
-    print(
-        f"95th percentile         : "
-        f"{candidate_series.quantile(0.95):.2f}"
-    )
-
-    print(
-        f"99th percentile         : "
-        f"{candidate_series.quantile(0.99):.2f}"
-    )
-
-    print(
-        f"Maximum candidates      : "
-        f"{candidate_series.max():,}"
-    )
-
-    # ========================================================
-    # MISSED MATCH EXAMPLES
-    # ========================================================
-
-    if missed_examples:
-
-        print("\n")
-        print("=" * 70)
-        print("MISSED TRUE MATCH EXAMPLES")
-        print("=" * 70)
-
-        for example in missed_examples:
-
-            print(
-                f"\nS1 ID: "
-                f"{example['s1_id']}"
-            )
-
-            print(
-                f"Name: "
-                f"{example['name']}"
-            )
-
-            print(
-                f"Address: "
-                f"{example['address']}"
-            )
-
-            print(
-                f"Missed target IDs: "
-                f"{example['missed']}"
-            )
-
-    else:
-
-        print("\n")
-        print(
-            "No missed true matches "
-            "in the sample."
-        )
-
-
-# ============================================================
-# MAIN
-# ============================================================
 
 def main():
 
-    print("=" * 70)
-    print("OPTIMIZED BLOCKING TEST")
-    print("=" * 70)
+    print("Loading data...")
 
-    # --------------------------------------------------------
-    # Load S1
-    # --------------------------------------------------------
+    s1 = pd.read_csv(
+        S1_FILE,
+        sep="\t",
+        dtype=str
+    )
 
-    print("\nLoading Source 1...")
+    s2 = pd.read_csv(
+        S2_FILE,
+        sep="\t",
+        dtype=str
+    )
 
-    s1 = load_source(
-        SOURCE1
+    s3 = pd.read_csv(
+        S3_FILE,
+        sep="\t",
+        dtype=str
+    )
+
+    print()
+    print("S1:", len(s1))
+    print("S2:", len(s2))
+    print("S3:", len(s3))
+
+    # ----------------------------------------
+    # ADD SOURCE LABEL
+    # ----------------------------------------
+
+    s2_indexed = []
+    s3_indexed = []
+
+    # Name index
+    print("\nBuilding name index...")
+
+    name_index = defaultdict(list)
+
+    name_frequency = Counter()
+
+    for source, df in [("S2", s2), ("S3", s3)]:
+
+        for idx, value in enumerate(df["business_name"]):
+
+            if not isinstance(value, str):
+                continue
+
+            tokens = set(get_tokens(normalize_name(value)))
+
+            for token in tokens:
+                name_frequency[token] += 1
+
+    useful_name_tokens = {
+        token
+        for token, count in name_frequency.items()
+        if count <= MAX_BLOCK_SIZE
+    }
+
+    print(
+        "Total name tokens:",
+        len(name_frequency)
     )
 
     print(
-        f"Source 1 records: "
-        f"{len(s1):,}"
+        "Useful name tokens:",
+        len(useful_name_tokens)
     )
 
-    # --------------------------------------------------------
-    # Load ground truth FIRST
-    # --------------------------------------------------------
+    for source, df in [("S2", s2), ("S3", s3)]:
 
-    print("\nLoading ground truth...")
+        for idx, value in enumerate(df["business_name"]):
 
-    ground_truth = load_ground_truth()
+            if not isinstance(value, str):
+                continue
+
+            tokens = set(get_tokens(normalize_name(value)))
+
+            for token in tokens:
+
+                if token in useful_name_tokens:
+                    name_index[token].append(
+                        (source, idx)
+                    )
+
+    # ----------------------------------------
+    # ADDRESS INDEX
+    # ----------------------------------------
+
+    print("\nBuilding address index...")
+
+    address_frequency = Counter()
+
+    for source, df in [("S2", s2), ("S3", s3)]:
+
+        for value in df["business_address"]:
+
+            if not isinstance(value, str):
+                continue
+
+            tokens = set(
+                get_tokens(
+                    normalize_address(value)
+                )
+            )
+
+            for token in tokens:
+                address_frequency[token] += 1
+
+    useful_address_tokens = {
+        token
+        for token, count in address_frequency.items()
+        if count <= MAX_BLOCK_SIZE
+    }
 
     print(
-        f"Ground truth records: "
-        f"{len(ground_truth):,}"
-    )
-
-    # --------------------------------------------------------
-    # Select sample
-    # --------------------------------------------------------
-
-    print(
-        f"\nSelecting "
-        f"{SAMPLE_SIZE:,} S1 records..."
-    )
-
-    (
-        sample_s1,
-        sample_ground_truth
-    ) = create_sample(
-        s1,
-        ground_truth
-    )
-
-    print(
-        f"Sample selected: "
-        f"{len(sample_s1):,}"
-    )
-
-    # We no longer need the full S1.
-    del s1
-
-    # --------------------------------------------------------
-    # Build truth dictionary
-    # --------------------------------------------------------
-
-    truth = build_truth_dictionary(
-        sample_ground_truth
-    )
-
-    del sample_ground_truth
-    del ground_truth
-
-    print(
-        "Sample ground truth prepared."
-    )
-
-    # --------------------------------------------------------
-    # Load S2
-    # --------------------------------------------------------
-
-    print("\nLoading Source 2...")
-
-    s2 = load_source(
-        SOURCE2
+        "Total address tokens:",
+        len(address_frequency)
     )
 
     print(
-        f"Source 2 records: "
-        f"{len(s2):,}"
+        "Useful address tokens:",
+        len(useful_address_tokens)
     )
 
-    # --------------------------------------------------------
-    # Load S3
-    # --------------------------------------------------------
+    address_index = defaultdict(list)
 
-    print("\nLoading Source 3...")
+    for source, df in [("S2", s2), ("S3", s3)]:
 
-    s3 = load_source(
-        SOURCE3
+        for idx, value in enumerate(df["business_address"]):
+
+            if not isinstance(value, str):
+                continue
+
+            tokens = set(
+                get_tokens(
+                    normalize_address(value)
+                )
+            )
+
+            for token in tokens:
+
+                if token in useful_address_tokens:
+                    address_index[token].append(
+                        (source, idx)
+                    )
+
+    # ----------------------------------------
+    # NUMBER INDEX
+    # ----------------------------------------
+
+    print("\nBuilding number index...")
+
+    number_frequency = Counter()
+
+    for source, df in [("S2", s2), ("S3", s3)]:
+
+        for value in df["business_address"]:
+
+            if not isinstance(value, str):
+                continue
+
+            for number in set(extract_numbers(value)):
+                number_frequency[number] += 1
+
+    useful_numbers = {
+        number
+        for number, count in number_frequency.items()
+        if count <= MAX_BLOCK_SIZE
+    }
+
+    number_index = defaultdict(list)
+
+    for source, df in [("S2", s2), ("S3", s3)]:
+
+        for idx, value in enumerate(df["business_address"]):
+
+            if not isinstance(value, str):
+                continue
+
+            for number in set(extract_numbers(value)):
+
+                if number in useful_numbers:
+                    number_index[number].append(
+                        (source, idx)
+                    )
+
+    print(
+        "Useful numbers:",
+        len(useful_numbers)
+    )
+
+    # ----------------------------------------
+    # TEST BLOCKING
+    # ----------------------------------------
+
+    print("\n" + "=" * 60)
+    print("TESTING BLOCKING V2")
+    print("=" * 60)
+
+    # Use same 20k sample as V1
+    sample = s1.sample(
+        n=20000,
+        random_state=42
+    )
+
+    candidate_counts = []
+
+    for count, (_, row) in enumerate(
+        sample.iterrows(),
+        start=1
+    ):
+
+        candidates = get_candidates(
+            row,
+            s2,
+            s3,
+            name_index,
+            address_index,
+            number_index
+        )
+
+        candidate_counts.append(len(candidates))
+
+        if count % 1000 == 0:
+            print(
+                f"Processed {count:,}/20,000"
+            )
+
+    candidate_counts = np.array(candidate_counts)
+
+    print("\nRESULTS")
+    print("-" * 60)
+
+    print(
+        "Average candidates:",
+        f"{candidate_counts.mean():,.2f}"
     )
 
     print(
-        f"Source 3 records: "
-        f"{len(s3):,}"
-    )
-
-    # --------------------------------------------------------
-    # Combine targets
-    # --------------------------------------------------------
-
-    print("\nCombining S2 + S3...")
-
-    targets = pd.concat(
-        [s2, s3],
-        ignore_index=True
+        "Median candidates:",
+        f"{np.median(candidate_counts):,.2f}"
     )
 
     print(
-        f"Target records: "
-        f"{len(targets):,}"
-    )
-
-    del s2
-    del s3
-
-    # --------------------------------------------------------
-    # Build indexes
-    # --------------------------------------------------------
-
-    indexes = build_index(
-        targets
-    )
-
-    del targets
-
-    print("\nIndexes built successfully.")
-
-    print(
-        f"Name countries: "
-        f"{len(indexes['name']):,}"
+        "90th percentile:",
+        f"{np.percentile(candidate_counts, 90):,.2f}"
     )
 
     print(
-        f"Address countries: "
-        f"{len(indexes['address']):,}"
+        "95th percentile:",
+        f"{np.percentile(candidate_counts, 95):,.2f}"
     )
 
     print(
-        f"Number countries: "
-        f"{len(indexes['number']):,}"
+        "99th percentile:",
+        f"{np.percentile(candidate_counts, 99):,.2f}"
     )
 
-    # --------------------------------------------------------
-    # Evaluate
-    # --------------------------------------------------------
-
-    evaluate_blocking(
-        sample_s1,
-        truth,
-        indexes
+    print(
+        "Maximum:",
+        f"{candidate_counts.max():,}"
     )
 
 
