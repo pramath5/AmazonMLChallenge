@@ -94,8 +94,8 @@ def main():
         round(singleton_count / len(ground_truth) * 100, 2),
         "%"
     )
-    print("\n\nMATCH SOURCE DISTRIBUTION")
 
+    print("\n\nMATCH SOURCE DISTRIBUTION")
     s2_matches = 0
     s3_matches = 0
 
