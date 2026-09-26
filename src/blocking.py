@@ -10,9 +10,9 @@ from preprocessing import (
 )
 
 
-S1_FILE = "../dataset/train/train_source1.tsv"
-S2_FILE = "../dataset/train/train_source2.tsv"
-S3_FILE = "../dataset/train/train_source3.tsv"
+S1_FILE =  TRAIN_DIR / "train_source1.tsv"
+S2_FILE = TRAIN_DIR / "train_source2.tsv"
+S3_FILE = TRAIN_DIR / "train_source3.tsv"
 
 
 # Maximum number of target records allowed in a block.
