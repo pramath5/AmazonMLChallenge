@@ -1,34 +1,70 @@
-# Python
-__pycache__/
-*.py[cod]
-*.pyo
+# ================================
+# Amazon ML Challenge - .gitignore
+# ================================
 
-# Virtual environment
-.venv/
-venv/
-env/
+# ----------------
+# Dataset
+# ----------------
+dataset/
 
-# Jupyter
-.ipynb_checkpoints/
+# ----------------
+# Generated TSV files
+# ----------------
+*.tsv
 
-# Challenge dataset
-datasets/
-# Generated outputs
-output/
+# ----------------
+# Large generated files
+# ----------------
+*.zip
+*.csv
+*.parquet
 
+# ----------------
 # Model files
+# ----------------
 *.pkl
 *.joblib
 *.model
+*.bin
 
-# Environment variables
+# ----------------
+# Python cache
+# ----------------
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# ----------------
+# Virtual environments
+# ----------------
+venv/
+.venv/
+env/
+
+# ----------------
+# Environment / secrets
+# ----------------
 .env
+.env.*
 
+# ----------------
+# Jupyter
+# ----------------
+.ipynb_checkpoints/
+
+# ----------------
 # VS Code
+# ----------------
 .vscode/
 
-# OS
+# ----------------
+# OS generated files
+# ----------------
 .DS_Store
 Thumbs.db
 
-dataset/
+# ----------------
+# Logs
+# ----------------
+*.log
